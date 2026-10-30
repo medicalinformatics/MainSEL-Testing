@@ -1,0 +1,352 @@
+services:
+# Central things
+  vault:
+    image: hashicorp/vault:latest
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: token123
+    healthcheck:
+      test: VAULT_ADDR=http://localhost:8200 vault status
+      start_period: 1m
+
+  pki-setup:
+    image: hashicorp/vault:latest
+    cap_add:
+      - IPC_LOCK
+    user: root
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: token123
+    volumes:
+      - ./pki-setup.sh:/pki-setup.sh:ro
+      - pki:/pki
+    command: ["sh", "/pki-setup.sh"]
+
+  secure-linkage-service:
+    image: samply/secure-linkage-service:develop
+    environment:
+      HOST: 0.0.0.0
+      PORT: 5000
+      PARTIES_CONFIG_FILE: /config/linkage-parties.toml
+    volumes:
+      - ./config/linkage-parties.toml:/config/linkage-parties.toml:ro
+    ports:
+      - 15000:5000
+    networks:
+      SiteA_intranet:
+        aliases:
+          - linkage-service
+      SiteB_intranet:
+        aliases:
+          - linkage-service
+
+  broker:
+    image: samply/beam-broker:develop-sockets
+    depends_on:
+      pki-setup:
+        condition: service_completed_successfully
+    environment:
+      BIND_ADDR: 0.0.0.0:4000
+      BROKER_URL: http://broker:4000
+      PKI_ADDRESS: http://vault:8200
+      PKI_APIKEY_FILE: /pki/pki.secret
+      ROOTCERT_FILE: /pki/root.crt.pem
+    volumes:
+      - pki:/pki:ro
+
+# Site A 
+  SiteA-beam-proxy:
+    image: samply/beam-proxy:develop-sockets
+    depends_on:
+      - broker
+    environment:
+      BROKER_URL: http://broker:4000
+      PROXY_ID: SiteA.broker
+      PRIVKEY_FILE: /pki/SiteA.priv.pem
+      ROOTCERT_FILE: /pki/root.crt.pem
+      APP_beamsel_KEY: testBeamSel
+    volumes:
+      - pki:/pki:ro
+    networks:
+      default:
+      SiteA_intranet:
+        aliases:
+          - beam-proxy
+
+  SiteA-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: mainzelliste-sel
+      POSTGRES_USER: mainzelliste-sel
+      POSTGRES_PASSWORD: mainzelliste
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mainzelliste-sel -d mainzelliste-sel"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - SiteA-ml-data:/var/lib/postgresql/data
+    networks:
+      SiteA_intranet:
+        aliases:
+          - postgres
+
+  SiteA-mainzelliste:
+    platform: linux/amd64
+    image: medicalinformatics/mainzelliste:secureepilinker-alpha
+    depends_on:
+      SiteA-postgres:
+        condition: service_healthy
+      SiteA-secureepilinker:
+        condition: service_started
+    ports:
+      - 18080:8080
+    environment: &SiteA_mainzelliste_env
+      ML_API_KEY: testApi
+      ML_DB_HOST: postgres
+      ML_DB_PORT: 5432
+      ML_DB_USER: mainzelliste-sel
+      ML_DB_NAME: mainzelliste-sel
+      ML_DB_PASS: mainzelliste
+      ML_FEATURE_SEL: "true"
+      ML_LOCAL_ID: SiteA
+      ML_LOCAL_SEL_URL: http://secureepilinker:8161
+      ML_LOCAL_CALLBACK_LINK_URL: http://mainzelliste:8080/Communicator/linkCallback
+      ML_LOCAL_CALLBACK_MATCH_URL: http://mainzelliste:8080/Communicator/matchCallback/SiteB
+      ML_LOCAL_DATA_SERVICE_URL: http://mainzelliste:8080/Communicator/getAllRecords
+      ML_LOCAL_AUTHENTICATION_TYPE: apiKey
+      ML_LOCAL_API_KEY: testApi
+      ML_SERVER_0_REMOTEID: SiteB
+      ML_SERVER_0_IDTYPE: link-SiteA-SiteB
+      ML_SERVER_0_REMOTE_SEL_URL: http://beamsel:8080
+      ML_SERVER_0_APIKEY: testApi
+      ML_SERVER_0_LINKAGE_SERVICE_BASE_URL: http://linkage-service:5000
+      ML_SERVER_0_LINKAGE_SERVICE_AUTH_TYPE: apiKey
+      ML_SERVER_0_LINKAGE_SERVICE_SHARED_KEY: testApi
+      ML_LOG_MODE: stdout
+      ML_LOG_LEVEL: INFO
+      no_proxy: localhost,secureepilinker,linkage-service
+    volumes:
+      - ./config/mainzelliste.conf.docker:/run/secrets/mainzelliste.docker.conf:ro
+      - ./config/sel.conf.docker:/run/secrets/sel.docker.conf:ro
+    networks:
+      SiteA_intranet:
+        aliases:
+          - mainzelliste
+
+  SiteA-secureepilinker:
+    platform: linux/amd64
+    image: ghcr.io/medicalinformatics/secureepilinker:ubuntu-dev
+    command: ["-vvvv"]
+    environment:
+      no_proxy: mainzelliste,beamsel,linkage-service
+    volumes:
+      - ./config/epilinker.serverconf.json:/data/serverconf.json:ro
+    ports:
+      - 18161:8161
+    networks:
+      SiteA_intranet:
+        aliases:
+          - secureepilinker
+
+  SiteA-beamsel:
+    image: docker.verbis.dkfz.de/onkofdz/beam-sel
+    depends_on:
+      - SiteA-beam-proxy
+      - SiteA-secureepilinker
+    environment:
+      RUST_LOG: trace,hyper=info,hyper_util=info,reqwest=info
+      BEAM_URL: http://beam-proxy:8081
+      BEAM_SECRET: testBeamSel
+      BEAM_ID: beamsel.SiteA.broker
+      SEL_ADDR: secureepilinker:8161
+    networks:
+      SiteA_intranet:
+        aliases:
+          - beamsel
+
+  SiteA-curl:
+    image: curlimages/curl:latest
+    entrypoint: ["sleep"]
+    command: ["infinity"]
+    networks:
+      - SiteA_intranet
+
+  SiteA-wait-for-mainzelliste:
+    image: curlimages/curl:latest
+    depends_on:
+      - SiteA-mainzelliste
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["until curl -fsS http://mainzelliste:8080/ >/dev/null; do sleep 2; done"]
+    networks:
+      - SiteA_intranet
+
+  SiteA-test-data-loader:
+    platform: linux/amd64
+    image: docker.verbis.dkfz.de/cord/mainzelliste-benchmark
+    depends_on:
+      SiteA-wait-for-mainzelliste:
+        condition: service_completed_successfully
+    volumes:
+      - ./test-data:/data:ro
+    command: ["ADD_PATIENT", "-i", "/data/testdata_SiteA.csv", "-c", "/data/transformation.csv.rules", "-t", "CSV", "-k", "testApi", "-u", "http://mainzelliste:8080", "-l", "20"]
+    networks:
+      - SiteA_intranet
+
+# Site B
+  SiteB-beam-proxy:
+    image: samply/beam-proxy:develop-sockets
+    depends_on:
+      - broker
+    environment:
+      BROKER_URL: http://broker:4000
+      PROXY_ID: SiteB.broker
+      PRIVKEY_FILE: /pki/SiteB.priv.pem
+      ROOTCERT_FILE: /pki/root.crt.pem
+      APP_beamsel_KEY: testBeamSel
+    volumes:
+      - pki:/pki:ro
+    networks:
+      default:
+      SiteB_intranet:
+        aliases:
+          - beam-proxy
+
+  SiteB-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: mainzelliste-sel
+      POSTGRES_USER: mainzelliste-sel
+      POSTGRES_PASSWORD: mainzelliste
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mainzelliste-sel -d mainzelliste-sel"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - SiteB-ml-data:/var/lib/postgresql/data
+    networks:
+      SiteB_intranet:
+        aliases:
+          - postgres
+
+  SiteB-mainzelliste:
+    platform: linux/amd64
+    image: medicalinformatics/mainzelliste:secureepilinker-alpha
+    depends_on:
+      SiteB-postgres:
+        condition: service_healthy
+      SiteB-secureepilinker:
+        condition: service_started
+    ports:
+      - 28080:8080
+    environment:
+      <<: *SiteA_mainzelliste_env
+      ML_LOCAL_ID: SiteB
+      ML_LOCAL_CALLBACK_MATCH_URL: http://mainzelliste:8080/Communicator/matchCallback/SiteA
+      ML_SERVER_0_REMOTEID: SiteA
+      ML_SERVER_0_IDTYPE: link-SiteB-SiteA
+    volumes:
+      - ./config/mainzelliste.conf.docker:/run/secrets/mainzelliste.docker.conf:ro
+      - ./config/sel.conf.docker:/run/secrets/sel.docker.conf:ro
+    networks:
+      SiteB_intranet:
+        aliases:
+          - mainzelliste
+
+  SiteB-secureepilinker:
+    platform: linux/amd64
+    image: ghcr.io/medicalinformatics/secureepilinker:ubuntu-dev
+    command: ["-vvvv"]
+    environment:
+      no_proxy: mainzelliste,beamsel,linkage-service
+    volumes:
+      - ./config/epilinker.serverconf.json:/data/serverconf.json:ro
+    ports:
+      - 28161:8161
+    networks:
+      SiteB_intranet:
+        aliases:
+          - secureepilinker
+
+  SiteB-beamsel:
+    image: docker.verbis.dkfz.de/onkofdz/beam-sel
+    depends_on:
+      - SiteB-beam-proxy
+      - SiteB-secureepilinker
+    environment:
+      RUST_LOG: trace,hyper=info,hyper_util=info,reqwest=info
+      BEAM_URL: http://beam-proxy:8081
+      BEAM_SECRET: testBeamSel
+      BEAM_ID: beamsel.SiteB.broker
+      SEL_ADDR: secureepilinker:8161
+    networks:
+      SiteB_intranet:
+        aliases:
+          - beamsel
+
+  SiteB-curl:
+    image: curlimages/curl:latest
+    entrypoint: ["sleep"]
+    command: ["infinity"]
+    networks:
+      - SiteB_intranet
+
+  SiteB-wait-for-mainzelliste:
+    image: curlimages/curl:latest
+    depends_on:
+      - SiteB-mainzelliste
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["until curl -fsS http://mainzelliste:8080/ >/dev/null; do sleep 2; done"]
+    networks:
+      - SiteB_intranet
+
+  SiteB-test-data-loader:
+    platform: linux/amd64
+    image: docker.verbis.dkfz.de/cord/mainzelliste-benchmark
+    depends_on:
+      SiteB-wait-for-mainzelliste:
+        condition: service_completed_successfully
+    volumes:
+      - ./test-data:/data:ro
+    command: ["ADD_PATIENT", "-i", "/data/testdata_SiteB.csv", "-c", "/data/transformation.csv.rules", "-t", "CSV", "-k", "testApi", "-u", "http://mainzelliste:8080", "-l", "20"]
+    networks:
+      - SiteB_intranet
+
+# Test executor
+  two-party-match-test:
+    image: docker:27-cli
+    depends_on:
+      SiteA-test-data-loader:
+        condition: service_completed_successfully
+      SiteB-test-data-loader:
+        condition: service_completed_successfully
+      SiteA-curl:
+        condition: service_started
+      SiteB-curl:
+        condition: service_started
+    environment:
+      POLL_SECONDS: 5
+      MAX_ATTEMPTS: 120
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./two-party-match.sh:/test/two-party-match.sh:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["apk add --no-cache jq >/dev/null && /test/two-party-match.sh"]
+
+networks:
+  SiteA_intranet:
+    name: SiteA_intranet
+    enable_ipv6: false
+  SiteB_intranet:
+    name: SiteB_intranet
+    enable_ipv6: false
+
+volumes:
+  pki:
+  SiteA-ml-data:
+  SiteB-ml-data:

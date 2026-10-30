@@ -1,0 +1,12 @@
+# Parties known to the central Linkage Service.
+#
+# `name` is the global MainSEL/Mainzelliste ID 
+# `hostname` is the internal key of the party
+
+[[parties]]
+name = "SiteA"
+hostname = "SiteA"
+
+[[parties]]
+name = "SiteB"
+hostname = "SiteB"
