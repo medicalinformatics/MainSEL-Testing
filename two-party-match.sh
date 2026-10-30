@@ -62,36 +62,32 @@ on_exit() {
 
 trap on_exit EXIT
 
-container_exists() {
-  docker container inspect "$1" >/dev/null 2>&1
-}
-
-curl_container_for_site() {
-  lookup_site=$1
-
-  for candidate in "${lookup_site}_curl_1" "smpc-rl-${lookup_site}-curl-1" "smpc_rl-${lookup_site}-curl-1"; do
-    if container_exists "$candidate"; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-
-  echo "Could not find curl container for site '$lookup_site'" >&2
-  return 1
+compose_project() {
+  docker container inspect "$HOSTNAME" \
+    --format '{{ index .Config.Labels "com.docker.compose.project" }}'
 }
 
 container_for_service() {
   lookup_service=$1
+  lookup_project=$(compose_project)
 
-  for candidate in "smpc-rl-${lookup_service}-1" "smpc_rl-${lookup_service}-1"; do
-    if container_exists "$candidate"; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
+  container=$(docker container ls \
+    --filter "label=com.docker.compose.project=${lookup_project}" \
+    --filter "label=com.docker.compose.service=${lookup_service}" \
+    --format '{{.ID}}' \
+    | head -n 1)
 
-  echo "Could not find container for service '$lookup_service'" >&2
+  if [ -n "$container" ]; then
+    printf '%s\n' "$container"
+    return 0
+  fi
+
+  echo "Could not find running container for service '$lookup_service' in Compose project '$lookup_project'" >&2
   return 1
+}
+
+curl_container_for_site() {
+  container_for_service "${1}-curl"
 }
 
 run_in_site() {
